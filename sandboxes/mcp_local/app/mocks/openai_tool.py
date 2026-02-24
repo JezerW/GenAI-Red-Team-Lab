@@ -6,11 +6,12 @@ routing requests to a local Ollama instance for testing purposes.
 
 import json
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Iterable, List, Literal
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from openai import OpenAI
-from pydantic import BaseModel
+from openai.types.chat import (ChatCompletionFunctionToolParam,
+                               ChatCompletionMessageFunctionToolCall)
 
 from mcp import ClientSession
 from mcp.client.sse import sse_client
@@ -53,13 +54,14 @@ async def chat_completions(
                 while iterations < MAX_ITERATIONS:
                     iterations += 1
 
-                    # Ask LLM for response
+                    tool_choice: Literal["none", "auto", "required"] = "auto"
+                    # Ignore overload as the tool_choice is literal
                     response = client.chat.completions.create(
                         model=request.model,
-                        messages=request.messages,
+                        messages=request.messages,  # type: ignore[arg-type]
                         temperature=request.temperature,
-                        tools=openai_tools if openai_tools else None,
-                        tool_choice="auto" if openai_tools else None,
+                        tools=openai_tools,
+                        tool_choice=tool_choice,
                     )
 
                     response_message = response.choices[0].message
@@ -69,51 +71,57 @@ async def chat_completions(
                         return response
 
                     for tool_call in response_message.tool_calls:
-                        tool_name = tool_call.function.name
-                        tool_args_raw = tool_call.function.arguments
+                        if isinstance(tool_call, ChatCompletionMessageFunctionToolCall):
+                            tool_name = tool_call.function.name
+                            tool_args_raw = tool_call.function.arguments
 
-                        # Execute the tool on the MCP Server
-                        print(
-                            f"DEBUG: Executing MCP Tool: {tool_name} with {tool_args_raw} on iteration #{str(iterations)}"
-                        )
-
-                        try:
-                            data = json.loads(tool_args_raw)
-                            # Execute on MCP Server
-                            tool_result = await session.call_tool(
-                                tool_name, arguments=data
+                            # Execute the tool on the MCP Server
+                            print(
+                                f"DEBUG: Executing MCP Tool: {tool_name} with {tool_args_raw} on iteration #{str(iterations)}"
                             )
 
-                            # Append tool call result to next function call
-                            request.messages.append(
-                                {
-                                    "role": "tool",
-                                    "tool_call_id": tool_call.id,
-                                    "name": tool_name,
-                                    "content": tool_result.content[0].text,
-                                }
-                            )
+                            try:
+                                data = json.loads(tool_args_raw)
+                                # Execute on MCP Server
+                                tool_result = await session.call_tool(
+                                    tool_name, arguments=data
+                                )
 
-                        except Exception as tool_err:
-                            # Handle execution failure so one bad tool doesn't crash the whole batch
-                            request.messages.append(
-                                {
-                                    "role": "tool",
-                                    "tool_call_id": tool_call.id,
-                                    "content": f"Error executing tool: {str(tool_err)}",
-                                }
-                            )
+                                tool_content = tool_result.content[0]
+                                assert hasattr(tool_content, "text")
+
+                                # Append tool call result to next function call
+                                request.messages.append(
+                                    {
+                                        "role": "tool",
+                                        "tool_call_id": tool_call.id,
+                                        "name": tool_name,
+                                        "content": tool_content.text,
+                                    }
+                                )
+
+                            except Exception as tool_err:
+                                # Handle execution failure so one bad tool doesn't crash the whole batch
+                                request.messages.append(
+                                    {
+                                        "role": "tool",
+                                        "tool_call_id": tool_call.id,
+                                        "content": f"Error executing tool: {str(tool_err)}",
+                                    }
+                                )
 
     except Exception as e:
         print(f"Workflow Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
-async def fetch_mcp_tools(session: ClientSession) -> [dict]:
+async def fetch_mcp_tools(
+    session: ClientSession,
+) -> Iterable[ChatCompletionFunctionToolParam]:
     mcp_result = await session.list_tools()
 
     # Transform MCP tools into OpenAI/Ollama Function format
-    openai_tools = [
+    openai_tools: List[ChatCompletionFunctionToolParam] = [
         {
             "type": "function",
             "function": {
@@ -129,7 +137,7 @@ async def fetch_mcp_tools(session: ClientSession) -> [dict]:
         for tool in mcp_result.tools
     ]
     print(
-        f"DEBUG: Tools available: {', '.join(tool['function']['name'] for tool in openai_tools)}"
+        f"DEBUG: Tools available: {', '.join(tool['function']['name'] for tool in openai_tools)}"  # type: ignore[index]
     )
 
     return openai_tools
